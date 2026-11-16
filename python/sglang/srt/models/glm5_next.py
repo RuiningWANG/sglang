@@ -621,6 +621,12 @@ class Glm5NextLinearAttention(nn.Module):
                 hidden_states, forward_batch
             )
 
+        from sglang.srt.utils.glm53_layer_trace import record_kda
+
+        record_kda(forward_batch, "projected-qkv", mixed_qkv)
+        record_kda(forward_batch, "projected-beta", beta)
+        record_kda(forward_batch, "projected-forget", forget_gate)
+        record_kda(forward_batch, "projected-norm-gate", g_proj_states)
         if not forward_batch.forward_mode.is_decode():
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
@@ -632,10 +638,12 @@ class Glm5NextLinearAttention(nn.Module):
             b=beta,
         )
 
+        record_kda(forward_batch, "recurrent-output", core_attn_out.squeeze(0))
         norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
+        record_kda(forward_batch, "norm-output", core_attn_out)
         return self.o_proj(core_attn_out)[0]
 
 
@@ -853,7 +861,15 @@ class Glm5NextDecoderLayer(nn.Module):
         zero_allocator: Optional[BumpAllocator] = None,
         gemm_output_zero_allocator: BumpAllocator = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        trace=None,
+        trace_layer=None,
     ):
+        from sglang.srt.utils.glm53_layer_trace import (
+            mhc_trace,
+            record,
+            trace_requested,
+        )
+
         hidden_states_orig = hidden_states
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -862,6 +878,10 @@ class Glm5NextDecoderLayer(nn.Module):
             forward_batch,
         )
 
+        if trace is not None:
+            record(trace, f"layer-{trace_layer:02d}/attn-input", hidden_states)
+        if trace is not None and trace_layer == 0:
+            forward_batch.glm53_kda_trace = trace
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -870,18 +890,34 @@ class Glm5NextDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             prev_topk_indices=prev_topk_indices,
         )
+        if hasattr(forward_batch, "glm53_kda_trace"):
+            del forward_batch.glm53_kda_trace
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
+        if trace is not None:
+            record(trace, f"layer-{trace_layer:02d}/attn-output", hidden_states)
         get_attn_tp_context().clear_attn_inputs()
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
+        forward_batch.glm53_trace_tp = (
+            trace_layer == 33
+            and trace_requested()
+            and forward_batch.batch_size == 1
         )
+        trace_token = mhc_trace.set(trace if trace_layer == 33 else None)
+        try:
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states,
+                residual,
+                forward_batch,
+            )
+        finally:
+            mhc_trace.reset(trace_token)
+            del forward_batch.glm53_trace_tp
 
+        if trace is not None:
+            record(trace, f"layer-{trace_layer:02d}/mlp-input", hidden_states)
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
@@ -917,6 +953,8 @@ class Glm5NextDecoderLayer(nn.Module):
                     gemm_output_zero_allocator,
                 )
 
+        if trace is not None:
+            record(trace, f"layer-{trace_layer:02d}/mlp-output", hidden_states)
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
 
@@ -1068,6 +1106,10 @@ class Glm5NextModel(nn.Module):
             # contract: the runner allocates no "residual" buffer because the
             # mHC boundary residual is None and prepare_attn never consumes it.
             residual = pp_proxy_tensors.tensors.get("residual")
+        from sglang.srt.utils.glm53_layer_trace import finish, record, start
+
+        trace = start(input_ids, positions, forward_batch)
+        record(trace, "embedding", hidden_states)
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -1128,7 +1170,10 @@ class Glm5NextModel(nn.Module):
                     zero_allocator,
                     gemm_output_zero_allocator,
                     prev_topk_indices=topk_indices,
+                    trace=trace,
+                    trace_layer=i,
                 )
+                record(trace, f"layer-{i:02d}", hidden_states)
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -1163,6 +1208,8 @@ class Glm5NextModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
+        record(trace, "norm", hidden_states)
+        finish(trace)
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states

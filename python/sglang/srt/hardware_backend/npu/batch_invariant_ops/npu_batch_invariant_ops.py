@@ -18,9 +18,15 @@ def npu_mean_batch_invariant(
 ):
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
     if len(dim) == 1:
-        return torch.ops.batch_invariant_ops.npu_reduce_mean_batch_invariant(
-            input, dim[0], keepdim=keepdim
+        axis = dim[0]
+        if not -input.ndim <= axis < input.ndim:
+            raise IndexError(f"Mean axis {axis} out of range for {input.ndim} dimensions")
+        axis %= input.ndim
+        moved = input.movedim(axis, -1).contiguous()
+        reduced = torch.ops.batch_invariant_ops.npu_reduce_mean_batch_invariant(
+            moved, moved.ndim - 1, keepdim=keepdim
         )
+        return reduced.movedim(-1, axis) if keepdim else reduced
     else:
         assert input.dtype in {
             torch.float16,

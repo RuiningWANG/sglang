@@ -94,14 +94,23 @@ class MHCState:
     def attn_to_mlp(
         self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
     ):
+        from sglang.srt.utils.glm53_layer_trace import record_mhc
+
+        record_mhc("pre-post-hidden", hidden_states)
+        record_mhc("pre-post-residual", residual)
+        record_mhc("pre-post-h-res", self.h_res)
+        record_mhc("pre-post-h-post", self.h_post)
         hidden_states = self.hc_post(hidden_states, residual, self.h_res, self.h_post)
+        record_mhc("post-output", hidden_states)
         residual = hidden_states
         out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
         hidden_states, self.h_res, self.h_post, norm_fused = self.hc_ffn_pre(
             hidden_states, out_norm_weight, out_norm_eps
         )
+        record_mhc("ffn-pre-output", hidden_states)
         if out_norm is not None and not norm_fused and hidden_states.shape[0] != 0:
             hidden_states = out_norm(hidden_states)
+        record_mhc("rms-output", hidden_states)
         return hidden_states, residual
 
     def mlp_combine(self, hidden_states, residual):
@@ -234,6 +243,16 @@ class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayer
                 "Unsupported: h_res/h_post allgather not implemented."
             )
 
+        from sglang.srt.utils.glm53_layer_trace import mhc_trace, record
+
+        if getattr(forward_batch, "glm53_trace_tp", False) and not forward_batch.forward_mode.is_idle():
+            from sglang.srt.distributed.parallel_state import get_attn_tp_group
+
+            group = get_attn_tp_group()
+            parts = group.all_gather(hidden_states.contiguous(), dim=0).unflatten(
+                0, (group.world_size, hidden_states.shape[0])
+            )
+            record(mhc_trace.get(), "layer-33/tp-local-inputs", parts.transpose(0, 1))
         hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states)
         if context.attn_dp_size != 1:
             if hidden_states.shape[0] != 0:
