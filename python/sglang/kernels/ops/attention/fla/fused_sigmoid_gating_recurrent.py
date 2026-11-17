@@ -462,7 +462,7 @@ def fused_sigmoid_gating_delta_rule_update(
     # PDL (sm90+): chain this kernel behind its producer conv1d_update, which
     # already launches dependents. Bit-exact (scheduling only) — benefits both
     # KDA and GDN recurrent paths.
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if q.device.type == "cuda" and is_arch_support_pdl() else {}
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,

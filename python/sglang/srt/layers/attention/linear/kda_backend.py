@@ -754,18 +754,37 @@ class KDAAttnBackend(MambaAttnBackendBase):
         conv_weights = (
             layer.conv_weights.to(mixed_qkv.dtype) if is_npu() else layer.conv_weights
         )
-        qkv = causal_conv1d_update_decode(
-            mixed_qkv,
-            conv_states.transpose(-1, -2),
-            conv_weights,
-            layer.bias,
-            activation="silu",
-            conv_state_indices=cache_indices,
+        per_sequence_decode = (
+            is_npu() and layer.lower_bound is not None
+            and os.getenv("GLM53_BI_KDA_DECODE_PER_SEQUENCE") == "1"
         )
-
-        from sglang.srt.utils.glm53_layer_trace import record_kda
-
-        record_kda(forward_batch, "after-convolution", qkv)
+        if per_sequence_decode:
+            if not getattr(self, "_bi_sequence_decode_logged", False):
+                rank0_log("GLM53 BI KDA decode uses per-sequence convolution and recurrence")
+                self._bi_sequence_decode_logged = True
+            if mixed_qkv.shape[0] != cache_indices.numel() or ssm_states.dtype != torch.float32:
+                raise RuntimeError("Per-sequence NPU decode requires one live token per slot and fp32 state")
+            offsets = query_start_loc.new_tensor([0, 1])
+            active = torch.ones(1, dtype=torch.bool, device=mixed_qkv.device)
+            qkv = torch.cat([
+                causal_conv1d_fn(
+                    mixed_qkv[index:index + 1].transpose(0, 1),
+                    conv_weights, layer.bias, activation="silu",
+                    conv_states=conv_states.transpose(-1, -2), has_initial_state=active,
+                    cache_indices=cache_indices[index:index + 1],
+                    query_start_loc=offsets, seq_lens_cpu=[1],
+                ).transpose(0, 1)
+                for index in range(cache_indices.numel())
+            ], dim=0)
+        else:
+            qkv = causal_conv1d_update_decode(
+                mixed_qkv,
+                conv_states.transpose(-1, -2),
+                conv_weights,
+                layer.bias,
+                activation="silu",
+                conv_state_indices=cache_indices,
+            )
 
         # The packed kernel assumes one token per request.
         if (
@@ -804,19 +823,36 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
-        core_attn_out = self.kernel_dispatcher.decode(
-            q=q,
-            k=k,
-            v=v,
-            a=a,
-            b=b,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            lower_bound=layer.lower_bound,
-        )
+        if per_sequence_decode:
+            gate = a.unsqueeze(0) if a.ndim == 2 else a
+            beta = b.unsqueeze(0) if b.ndim == 2 else b
+            core_attn_out = torch.cat([
+                self.kernel_dispatcher.decode(
+                    q=q[:, index:index + 1].contiguous(),
+                    k=k[:, index:index + 1].contiguous(),
+                    v=v[:, index:index + 1].contiguous(),
+                    a=gate[:, index:index + 1].contiguous(),
+                    b=beta[:, index:index + 1].contiguous(),
+                    A_log=layer.A_log, dt_bias=layer.dt_bias, ssm_states=ssm_states,
+                    cache_indices=cache_indices[index:index + 1],
+                    query_start_loc=offsets, lower_bound=layer.lower_bound,
+                )
+                for index in range(cache_indices.numel())
+            ], dim=1)
+        else:
+            core_attn_out = self.kernel_dispatcher.decode(
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                lower_bound=layer.lower_bound,
+            )
 
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
