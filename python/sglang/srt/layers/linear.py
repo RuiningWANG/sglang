@@ -1470,6 +1470,7 @@ class RowParallelLinear(LinearBase):
         self.with_bias = bias
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
+        self.glm53_ordered_projection = False
         self.use_dp_attention_reduce = use_dp_attention_reduce
 
         # Divide the weight matrix along the last dimension.
@@ -1616,6 +1617,26 @@ class RowParallelLinear(LinearBase):
         forward_batch=None,
         output_tensor=None,
     ):
+        if (
+            self.glm53_ordered_projection
+            and isinstance(input_, torch.Tensor)
+            and input_.device.type == "npu"
+            and input_.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+            and self.bias is None
+            and self.tp_size == 8
+            and self.input_is_parallel
+            and not self.reduce_results
+            and not skip_all_reduce
+            and output_tensor is None
+            and not get_forward().sp_active
+        ):
+            from sglang.srt.hardware_backend.npu.glm53_parity import projection_shard
+
+            partial = projection_shard(input_, self.weight)
+            partial._glm53_attention_rank_order = True
+            return partial, None
+
         if self.input_is_parallel:
             input_parallel = input_
         else:

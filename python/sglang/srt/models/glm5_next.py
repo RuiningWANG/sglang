@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import nullcontext
 from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -694,6 +695,10 @@ class Glm5NextDecoderLayer(nn.Module):
                 is_nextn=is_nextn,
                 skip_rope=True,
             )
+
+        flag = "GLM53_STRICT_KDA_PROJECT" if self.is_linear_attn else "GLM53_STRICT_MLA_PROJECT"
+        if quant_config is None and os.getenv(flag) == "1":
+            self.self_attn.o_proj.glm53_ordered_projection = True
 
         if config.q_lora_rank is None and envs.SGLANG_USE_AG_AFTER_QLORA.get():
             raise ValueError(

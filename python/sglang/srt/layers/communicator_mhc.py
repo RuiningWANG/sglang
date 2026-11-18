@@ -234,7 +234,13 @@ class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayer
                 "Unsupported: h_res/h_post allgather not implemented."
             )
 
-        hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states)
+        if getattr(hidden_states, "_glm53_attention_rank_order", False):
+            from sglang.srt.distributed.parallel_state import get_attn_tp_group
+            from sglang.srt.hardware_backend.npu.glm53_parity import gathered_eight_shard_sum
+
+            hidden_states = gathered_eight_shard_sum(get_attn_tp_group(), hidden_states)
+        else:
+            hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states)
         if context.attn_dp_size != 1:
             if hidden_states.shape[0] != 0:
                 with use_symmetric_memory(
