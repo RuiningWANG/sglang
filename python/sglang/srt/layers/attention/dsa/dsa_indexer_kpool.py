@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -237,6 +239,7 @@ class IndexerKPool(MultiPlatformOp):
         config: Optional[PretrainedConfig] = None,
     ):
         super().__init__()
+        self.zero_mismatch = os.getenv("GLM53_STRICT_DECODE_INDEXER_WEIGHTS") == "1"
         self.hidden_size = hidden_size
         self.n_heads = index_n_heads
         self.head_dim = index_head_dim
@@ -2110,6 +2113,21 @@ class IndexerKPool(MultiPlatformOp):
         and the torch-side pool_seqlens / pool_block_tables construction, which
         torch.compile splits into ~13 small ops.
         """
+        if (
+            self.zero_mismatch
+            and x.device.type == "npu"
+            and x.dtype == torch.bfloat16
+        ):
+            lengths = metadata.get_seqlens_int32()
+            x = x[:lengths.shape[0]]
+            weights = self._get_logits_head_gate_npu(x).squeeze(-1).to(torch.bfloat16)
+            tables = metadata.get_page_table_64()
+            if tables.shape[1] == 0:
+                tables = F.pad(tables, (0, self.index_kpool))
+            pooled_lengths = torch.div(lengths, self.index_kpool, rounding_mode="floor")
+            pooled_tables = tables[:, ::self.index_kpool].contiguous()
+            return weights, pooled_lengths, pooled_tables
+
         from sglang.srt.layers.attention.dsa.kpool_decode_prepare_indexer import (
             fused_decode_prepare_indexer,
         )
