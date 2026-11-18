@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
@@ -455,6 +456,7 @@ class InputLogprobProcessor:
         self.enable_fast_input_logprobs = (
             envs.SGLANG_ENABLE_FAST_INPUT_LOGPROBS.get()
             and not _deterministic_inference_enabled()
+            and os.getenv("GLM53_STRICT_SGLANG_BI") != "1"
         )
 
     def forward(

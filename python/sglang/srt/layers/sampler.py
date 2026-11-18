@@ -1,4 +1,5 @@
 import logging
+import os
 from functools import partial
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
@@ -232,7 +233,10 @@ class Sampler(nn.Module):
                 # prefill/decode logprob alignment.
                 if (
                     return_logprob
-                    and self.enable_deterministic
+                    and (
+                        self.enable_deterministic
+                        or (logits.device.type == "npu" and os.getenv("GLM53_STRICT_SGLANG_BI") == "1")
+                    )
                     and logprobs_via_logsoftmax_kernel is None
                     and not SGLANG_RETURN_ORIGINAL_LOGPROB
                 ):
