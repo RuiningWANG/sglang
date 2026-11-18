@@ -7,6 +7,8 @@ Hadamard transform, FP8 quantization, or per-slot scale storage.
 import math
 from typing import Optional
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -164,6 +166,10 @@ def _kpool_decode_update_and_maybe_write_cache_bf16_kernel(
     tl.store(tail_score_ptr + tail_score_offset, score_current, mask=update_mask)
 
 
+def _align_decode_pooling():
+    return os.getenv("GLM53_STRICT_KPOOL_DECODE") == "1"
+
+
 def kpool_decode_update_and_maybe_write_cache_bf16(
     buf: torch.Tensor,             # [num_pages, SLOTS_PER_PAGE * HEAD_DIM] bfloat16
     tail_k: torch.Tensor,          # [REQ_POOL_SIZE, TAIL_SIZE, HEAD_DIM] bfloat16
@@ -190,6 +196,45 @@ def kpool_decode_update_and_maybe_write_cache_bf16(
     """
     batch = key.shape[0]
     if batch == 0:
+        return
+
+    if key.device.type == "npu" and head_dim == 128 and _align_decode_pooling():
+        assert tail_k.is_contiguous() and tail_score.is_contiguous()
+        key = key.contiguous()
+        slot_score = slot_score.contiguous()
+        ape = ape.contiguous()
+        positions = positions[:batch].contiguous()
+        requests = req_pool_indices[:batch].contiguous()
+        safe_positions = positions.clamp_min(0)
+        pool_ids = torch.div(safe_positions, pool_size, rounding_mode="floor")
+        columns = torch.div(pool_ids, slots_per_page, rounding_mode="floor") * pool_size
+        columns = columns.clamp(0, block_tables.shape[1] - 1).long()
+        pages = block_tables[:batch].gather(1, columns[:, None]).squeeze(1).long()
+        locations = (pages * slots_per_page + pool_ids % slots_per_page).view(batch, 1)
+        valid = (
+            (requests >= 0) & (requests < tail_k.shape[0])
+            & (positions >= 0) & (positions < seq_lens[:batch])
+        )
+        out_locations = torch.where(valid, out_cache_loc[:batch], 0).contiguous()
+        starts = (pool_ids * pool_size).contiguous()
+        cache = buf.view(-1, head_dim)
+        programs = min(batch, _default_triton_num_programs(key.device, batch))
+        dummy = torch.empty((1,), device=key.device, dtype=torch.int32)
+        _kpool_write_tail_and_maybe_compress_npu_kernel[(programs,)](
+            key_ptr=key, score_ptr=slot_score, tail_k_ptr=tail_k,
+            tail_score_ptr=tail_score, ape_ptr=ape,
+            req_pool_indices_ptr=requests, write_start_ptr=safe_positions,
+            tail_logical_start_ptr=starts, write_loc_ptr=locations,
+            out_cache_loc_ptr=out_locations, effective_n_ptr=dummy, cache_ptr=cache,
+            batch_size=batch,
+            key_stride_0=key.stride(0), score_stride_0=slot_score.stride(0),
+            tail_k_stride_0=tail_k.stride(0), tail_k_stride_1=tail_k.stride(1),
+            tail_score_stride_0=tail_score.stride(0), tail_score_stride_1=tail_score.stride(1),
+            ape_stride_0=ape.stride(0), write_loc_stride_0=locations.stride(0),
+            cache_stride_0=cache.stride(0),
+            N=1, POOL_SIZE=pool_size, TAIL_SIZE=tail_k.shape[1], HEAD_DIM=head_dim,
+            MAX_CLOSED_POOLS=1, HAS_EFFECTIVE_N=False, BLOCK_D=128,
+        )
         return
 
     assert buf.dtype == torch.bfloat16
