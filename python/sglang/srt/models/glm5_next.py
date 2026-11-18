@@ -742,6 +742,9 @@ class Glm5NextDecoderLayer(nn.Module):
                 swiglu_limit=config.swiglu_limit,
             )
 
+        if not self.is_layer_sparse and quant_config is None and os.getenv("GLM53_STRICT_DENSE_PROJECT") == "1":
+            self.mlp.down_proj.glm53_ordered_projection = True
+
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
