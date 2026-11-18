@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -892,31 +893,68 @@ class KDAAttnBackend(MambaAttnBackendBase):
             a = a.unflatten(-1, (-1, layer.head_k_dim))
 
         track_ssm = self.forward_metadata.has_mamba_track_mask
-        core_attn_out = self.kernel_dispatcher.extend(
-            q=q,
-            k=k,
-            v=v,
-            g=a,
-            beta=b,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            lower_bound=layer.lower_bound,
-            beta_is_raw=gate_was_flat,
-            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            # draft_extend_v2 must stay rollback-able, so kernels that commit state
-            # in place (e.g. FlashKDA) must not run for it.
-            is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
-            return_intermediate_states=track_ssm,
-            # Which global chunk rows of h the track snapshot will read; lets
-            # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
-            # fast path when the snapshot only needs the final state.
-            track_ssm_h_src=(
-                self.forward_metadata.track_ssm_h_src if track_ssm else None
-            ),
-        )
+        # Diagnostic: share the native recurrent forward and keep its boundary
+        # state in fp32 so a decode cache round-trip preserves the recurrence.
+        if (
+            is_npu()
+            and os.getenv("GLM53_BI_KDA_MODE") == "per-sequence"
+            and layer.lower_bound is not None
+            and gate_was_flat
+            and not track_ssm and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            if ssm_states.dtype != torch.float32:
+                raise RuntimeError(f"Shared KDA requires FP32 temporal state, got {ssm_states.dtype}")
+            # Compare the same recurrence per sequence without using packed
+            # offset arithmetic, writing back to the actual per-request slot.
+            lengths = tuple(int(n) for n in forward_batch.extend_seq_lens_cpu)
+            if sum(lengths) != logical_num_tokens or len(lengths) != cache_indices.numel():
+                raise RuntimeError("Shared KDA prefill length/slot metadata disagrees")
+            results = []
+            begin = 0
+            for request_index, length in enumerate(lengths):
+                if length == 0:
+                    continue
+                end = begin + length
+                offsets = query_start_loc.new_tensor([0, length])
+                results.append(self.kernel_dispatcher.decode(
+                    q=q[:, begin:end].contiguous(),
+                    k=k[:, begin:end].contiguous(),
+                    v=v[:, begin:end].contiguous(),
+                    a=a[:, begin:end].contiguous(),
+                    b=b[:, begin:end].contiguous(),
+                    A_log=layer.A_log, dt_bias=layer.dt_bias,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices[request_index:request_index + 1],
+                    query_start_loc=offsets, lower_bound=layer.lower_bound,
+                ))
+                begin = end
+            core_attn_out = torch.cat(results, dim=1) if results else v
+        else:
+            core_attn_out = self.kernel_dispatcher.extend(
+                q=q,
+                k=k,
+                v=v,
+                g=a,
+                beta=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                lower_bound=layer.lower_bound,
+                beta_is_raw=gate_was_flat,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                # draft_extend_v2 must stay rollback-able, so kernels that commit state
+                # in place (e.g. FlashKDA) must not run for it.
+                is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
+                return_intermediate_states=track_ssm,
+                # Which global chunk rows of h the track snapshot will read; lets
+                # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
+                # fast path when the snapshot only needs the final state.
+                track_ssm_h_src=(
+                    self.forward_metadata.track_ssm_h_src if track_ssm else None
+                ),
+            )
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
