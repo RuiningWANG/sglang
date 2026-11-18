@@ -764,18 +764,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self._bi_sequence_decode_logged = True
             if mixed_qkv.shape[0] != cache_indices.numel() or ssm_states.dtype != torch.float32:
                 raise RuntimeError("Per-sequence NPU decode requires one live token per slot and fp32 state")
-            offsets = query_start_loc.new_tensor([0, 1])
-            active = torch.ones(1, dtype=torch.bool, device=mixed_qkv.device)
-            qkv = torch.cat([
-                causal_conv1d_fn(
-                    mixed_qkv[index:index + 1].transpose(0, 1),
-                    conv_weights, layer.bias, activation="silu",
-                    conv_states=conv_states.transpose(-1, -2), has_initial_state=active,
-                    cache_indices=cache_indices[index:index + 1],
-                    query_start_loc=offsets, seq_lens_cpu=[1],
-                ).transpose(0, 1)
-                for index in range(cache_indices.numel())
-            ], dim=0)
+            from .kda_graph_conv import decode_graph_conv
+            offsets = query_start_loc[:2]
+            qkv = decode_graph_conv(
+                mixed_qkv, conv_weights, layer.bias, conv_states.transpose(-1, -2), cache_indices
+            )
         else:
             qkv = causal_conv1d_update_decode(
                 mixed_qkv,
