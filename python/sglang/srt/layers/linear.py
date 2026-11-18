@@ -1626,16 +1626,24 @@ class RowParallelLinear(LinearBase):
             and self.bias is None
             and self.tp_size == 8
             and self.input_is_parallel
-            and not self.reduce_results
+            and input_.numel()
             and not skip_all_reduce
             and output_tensor is None
             and not get_forward().sp_active
         ):
-            from sglang.srt.hardware_backend.npu.glm53_parity import projection_shard
+            from sglang.srt.hardware_backend.npu.glm53_parity import (
+                gathered_eight_shard_sum,
+                projection_shard,
+            )
 
-            partial = projection_shard(input_, self.weight)
-            partial._glm53_attention_rank_order = True
-            return partial, None
+            if self.reduce_results:
+                if not should_skip_mlp_all_reduce() and not get_exec().comm.enable_quant_communications:
+                    group = get_parallel().attn_tp_group if self.use_dp_attention_reduce else get_tp_group()
+                    return gathered_eight_shard_sum(group, projection_shard(input_, self.weight)), None
+            else:
+                partial = projection_shard(input_, self.weight)
+                partial._glm53_attention_rank_order = True
+                return partial, None
 
         if self.input_is_parallel:
             input_parallel = input_
