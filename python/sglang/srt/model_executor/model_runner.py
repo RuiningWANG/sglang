@@ -798,7 +798,9 @@ class ModelRunner:
             self.init_lora_manager()
 
     def maybe_enable_batch_invariant_mode(self):
-        if get_exec().deterministic.enable_deterministic_inference:
+        if get_exec().deterministic.enable_deterministic_inference or (
+            self.device == "npu" and os.getenv("GLM53_STRICT_SGLANG_BI") == "1"
+        ):
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
