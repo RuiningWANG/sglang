@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -353,6 +354,17 @@ class ModelRunner:
         # draft runners, which serve adapters' target model unadapted.
         self.lora_manager: Optional[LoRAManager] = None
         self.device = get_device().device
+        if self.device == "npu" and (
+            os.getenv("GLM53_TRAIN_ROLLOUT_PARITY") == "1"
+            or os.getenv("GLM53_NPU_DETERMINISTIC_LEVEL_3") == "1"
+        ):
+            import torch_npu
+
+            torch_npu.npu.set_deterministic_level(3)
+            level = torch_npu.npu._get_deterministic_level()
+            if level != 3:
+                raise RuntimeError(f"Expected NPU deterministic level 3, got {level}")
+            logger.info("GLM53 NPU deterministic level %s", level)
         self.draft_attention_backend = resolve_draft_attention_backend(
             draft_attention_backend=draft_attention_backend,
             is_draft_worker=is_draft_worker,
@@ -419,8 +431,6 @@ class ModelRunner:
         try:
             torch.get_device_module(self.device).set_device(ps.gpu_id)
         except Exception:
-            import os
-
             logger.warning(
                 f"Context: {self.device=} {ps.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {ps.tp_rank=} {ps.tp_size=}"
             )
