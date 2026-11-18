@@ -926,40 +926,66 @@ class KDAAttnBackend(MambaAttnBackendBase):
             a = a.unflatten(-1, (-1, layer.head_k_dim))
 
         track_ssm = self.forward_metadata.has_mamba_track_mask
-        # Diagnostic: share the native recurrent forward and keep its boundary
+        # Use the decode recurrence in prefill and keep its boundary
         # state in fp32 so a decode cache round-trip preserves the recurrence.
-        if (
-            is_npu()
+        track_recurrent = track_ssm and os.getenv("GLM53_STRICT_KDA_RADIX") == "1"
+        use_recurrence = (
+            is_npu() and layer.lower_bound is not None and gate_was_flat
             and os.getenv("GLM53_BI_KDA_MODE") == "per-sequence"
-            and layer.lower_bound is not None
-            and gate_was_flat
-            and not track_ssm and not forward_batch.forward_mode.is_draft_extend_v2()
-        ):
+            and (not track_ssm or track_recurrent)
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        )
+        if use_recurrence:
             if ssm_states.dtype != torch.float32:
                 raise RuntimeError(f"Shared KDA requires FP32 temporal state, got {ssm_states.dtype}")
-            # Compare the same recurrence per sequence without using packed
+            # Run the same recurrence per sequence without using packed
             # offset arithmetic, writing back to the actual per-request slot.
             lengths = tuple(int(n) for n in forward_batch.extend_seq_lens_cpu)
             if sum(lengths) != logical_num_tokens or len(lengths) != cache_indices.numel():
                 raise RuntimeError("Shared KDA prefill length/slot metadata disagrees")
-            results = []
-            begin = 0
-            for request_index, length in enumerate(lengths):
-                if length == 0:
-                    continue
-                end = begin + length
-                offsets = query_start_loc.new_tensor([0, length])
-                results.append(self.kernel_dispatcher.decode(
+            checkpoints = {}
+            if track_recurrent:
+                from .kda_radix_snapshot import prefix_checkpoints
+                from sglang.srt.layers.attention.hybrid_linear_attn_backend import KDA_CHUNK_SIZE
+
+                checkpoints = prefix_checkpoints(
+                    self.forward_metadata, forward_batch, lengths, KDA_CHUNK_SIZE,
+                )
+
+            def recurrent(begin, end, slot):
+                return self.kernel_dispatcher.decode(
                     q=q[:, begin:end].contiguous(),
                     k=k[:, begin:end].contiguous(),
                     v=v[:, begin:end].contiguous(),
                     a=a[:, begin:end].contiguous(),
                     b=b[:, begin:end].contiguous(),
                     A_log=layer.A_log, dt_bias=layer.dt_bias,
-                    ssm_states=ssm_states,
-                    cache_indices=cache_indices[request_index:request_index + 1],
-                    query_start_loc=offsets, lower_bound=layer.lower_bound,
-                ))
+                    ssm_states=ssm_states, cache_indices=slot,
+                    query_start_loc=query_start_loc.new_tensor([0, end - begin]),
+                    lower_bound=layer.lower_bound,
+                )
+
+            results = []
+            begin = 0
+            for request, length in enumerate(lengths):
+                if length == 0:
+                    continue
+                end = begin + length
+                slot = cache_indices[request:request + 1]
+                checkpoint = checkpoints.get(request)
+                if checkpoint is None:
+                    results.append(recurrent(begin, end, slot))
+                else:
+                    track = forward_batch.mamba_track_indices[request:request + 1]
+                    source, destination = slot.long(), track.long()
+                    # Keep the output path identical to untracked recurrence.
+                    # An intermediate checkpoint advances a separate cache slot.
+                    if checkpoint < length:
+                        ssm_states.index_copy_(0, destination, ssm_states.index_select(0, source))
+                        recurrent(begin, begin + checkpoint, track)
+                    results.append(recurrent(begin, end, slot))
+                    if checkpoint == length:
+                        ssm_states.index_copy_(0, destination, ssm_states.index_select(0, source))
                 begin = end
             core_attn_out = torch.cat(results, dim=1) if results else v
         else:
@@ -988,7 +1014,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.track_ssm_h_src if track_ssm else None
                 ),
             )
-        if track_ssm:
+        if track_ssm and not use_recurrence:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
             # ping-pong track slots (see _init_track_ssm_indices).
