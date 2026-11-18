@@ -579,6 +579,7 @@ class DeepseekV2MoE(nn.Module):
         super().__init__()
         self.tp_size = get_parallel().tp_size
         self.moe_ep_size = get_parallel().moe_ep_size
+        self.glm53_ordered_reduction = False
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
 
@@ -1057,7 +1058,7 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = self._reduce_tp_experts(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if self._shared_expert_tp1:
@@ -1197,12 +1198,28 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = self._reduce_tp_experts(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:
             final_hidden_states += shared_output
         return final_hidden_states
+
+    def _reduce_tp_experts(self, x):
+        if (
+            self.glm53_ordered_reduction
+            and self.tp_size == 8
+            and self.moe_ep_size == 1
+            and self.num_fused_shared_experts == 0
+            and not self._shared_expert_tp1
+            and x.dtype == torch.bfloat16
+            and x.device.type == "npu"
+        ):
+            from sglang.srt.distributed.parallel_state import get_tp_group
+            from sglang.srt.hardware_backend.npu.glm53_parity import gathered_eight_shard_sum
+
+            return gathered_eight_shard_sum(get_tp_group(), x)
+        return tensor_model_parallel_all_reduce(x)
 
     def forward_cpu(
         self,

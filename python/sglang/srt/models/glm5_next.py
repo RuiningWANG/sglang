@@ -726,6 +726,11 @@ class Glm5NextDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
             )
+            self.mlp.glm53_ordered_reduction = (
+                quant_config is None
+                and moe_quant_config_override is None
+                and os.getenv("GLM53_STRICT_MOE_PROJECT") == "1"
+            )
         else:
             if enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
