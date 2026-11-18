@@ -765,6 +765,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             if mixed_qkv.shape[0] != cache_indices.numel() or ssm_states.dtype != torch.float32:
                 raise RuntimeError("Per-sequence NPU decode requires one live token per slot and fp32 state")
             from .kda_graph_conv import decode_graph_conv
+            if os.getenv("GLM53_KDA_GROUPED_CONV") == "1":
+                from .kda_grouped import grouped_decode_conv
+                decode_graph_conv = grouped_decode_conv
+
             offsets = query_start_loc[:2]
             qkv = decode_graph_conv(
                 mixed_qkv, conv_weights, layer.bias, conv_states.transpose(-1, -2), cache_indices
@@ -816,7 +820,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
-        if per_sequence_decode:
+        if per_sequence_decode and os.getenv("GLM53_KDA_GROUPED_RECURRENCE") != "1":
             gate = a.unsqueeze(0) if a.ndim == 2 else a
             beta = b.unsqueeze(0) if b.ndim == 2 else b
             core_attn_out = torch.cat([
@@ -833,6 +837,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 for index in range(cache_indices.numel())
             ], dim=1)
         else:
+            if per_sequence_decode:
+                # Native replay collapses padding offsets. The accepted
+                # per-request path consumes one row even for sentinel slots.
+                # Reuse the immutable full arange to initialize every row.
+                full_offsets = self.cached_cuda_graph_decode_query_start_loc
+                if full_offsets is None or full_offsets.numel() < q.shape[1] + 1:
+                    full_offsets = torch.arange(q.shape[1] + 1, device=q.device, dtype=torch.int32)
+                query_start_loc = full_offsets[:q.shape[1] + 1]
             core_attn_out = self.kernel_dispatcher.decode(
                 q=q,
                 k=k,
@@ -965,29 +977,41 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     lower_bound=layer.lower_bound,
                 )
 
-            results = []
-            begin = 0
-            for request, length in enumerate(lengths):
-                if length == 0:
-                    continue
-                end = begin + length
-                slot = cache_indices[request:request + 1]
-                checkpoint = checkpoints.get(request)
-                if checkpoint is None:
-                    results.append(recurrent(begin, end, slot))
-                else:
-                    track = forward_batch.mamba_track_indices[request:request + 1]
-                    source, destination = slot.long(), track.long()
-                    # Keep the output path identical to untracked recurrence.
-                    # An intermediate checkpoint advances a separate cache slot.
-                    if checkpoint < length:
-                        ssm_states.index_copy_(0, destination, ssm_states.index_select(0, source))
-                        recurrent(begin, begin + checkpoint, track)
-                    results.append(recurrent(begin, end, slot))
-                    if checkpoint == length:
-                        ssm_states.index_copy_(0, destination, ssm_states.index_select(0, source))
-                begin = end
-            core_attn_out = torch.cat(results, dim=1) if results else v
+            if os.getenv("GLM53_KDA_GROUPED_RECURRENCE") == "1":
+                from .kda_grouped import grouped_prefill_recurrence
+
+                core_attn_out = grouped_prefill_recurrence(
+                    self.kernel_dispatcher, (q, k, v, a, b), A_log=layer.A_log,
+                    dt_bias=layer.dt_bias, ssm_states=ssm_states,
+                    cache_indices=cache_indices, query_start_loc=query_start_loc,
+                    lengths=lengths, lower_bound=layer.lower_bound,
+                    checkpoints=checkpoints,
+                    track_indices=forward_batch.mamba_track_indices if checkpoints else None,
+                )
+            else:
+                results = []
+                begin = 0
+                for request, length in enumerate(lengths):
+                    if length == 0:
+                        continue
+                    end = begin + length
+                    slot = cache_indices[request:request + 1]
+                    checkpoint = checkpoints.get(request)
+                    if checkpoint is None:
+                        results.append(recurrent(begin, end, slot))
+                    else:
+                        track = forward_batch.mamba_track_indices[request:request + 1]
+                        source, destination = slot.long(), track.long()
+                        # Keep the output path identical to untracked recurrence.
+                        # An intermediate checkpoint advances a separate cache slot.
+                        if checkpoint < length:
+                            ssm_states.index_copy_(0, destination, ssm_states.index_select(0, source))
+                            recurrent(begin, begin + checkpoint, track)
+                        results.append(recurrent(begin, end, slot))
+                        if checkpoint == length:
+                            ssm_states.index_copy_(0, destination, ssm_states.index_select(0, source))
+                    begin = end
+                core_attn_out = torch.cat(results, dim=1) if results else v
         else:
             core_attn_out = self.kernel_dispatcher.extend(
                 q=q,
