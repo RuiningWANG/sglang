@@ -22,6 +22,8 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 import os
 from array import array
 from collections import defaultdict
+from dataclasses import replace
+from math import lcm
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -450,6 +452,14 @@ class MambaRadixCache(BasePrefixCache):
                 params.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
             )
         )
+        self.kpool_checkpoint_alignment = 1
+        if os.getenv("GLM53_STRICT_KPOOL_CACHE") == "1" and params.enable_mamba_extra_buffer:
+            cache = getattr(params.token_to_kv_pool_allocator, "_kvcache", None)
+            cache = getattr(cache, "full_kv_pool", cache)
+            if getattr(cache, "_kpool_use_compress", False):
+                self.kpool_checkpoint_alignment = int(cache.page_size) * int(cache.index_kpool)
+                params = replace(params, page_size=lcm(params.page_size, self.kpool_checkpoint_alignment))
+
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
@@ -545,6 +555,9 @@ class MambaRadixCache(BasePrefixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ) -> None:
         """Cache request when it finishes."""
+        checkpoint = req.kv.mamba_last_track_seqlen
+        if checkpoint is not None and checkpoint % self.kpool_checkpoint_alignment != 0:
+            is_insert = False
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, :kv_len_to_handle
@@ -688,7 +701,7 @@ class MambaRadixCache(BasePrefixCache):
             if self.enable_mamba_extra_buffer
             else len(token_ids)
         )
-        if self.disable or cache_len is None:
+        if self.disable or cache_len is None or cache_len % self.kpool_checkpoint_alignment:
             return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
