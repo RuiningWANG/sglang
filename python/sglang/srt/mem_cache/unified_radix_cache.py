@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 import threading
 import time
 from dataclasses import replace
+from math import lcm
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -150,6 +152,14 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         params: CacheInitParams,
     ):
+        self.kpool_checkpoint_alignment = 1
+        if os.getenv("GLM53_STRICT_KPOOL_CACHE") == "1" and params.enable_mamba_extra_buffer:
+            cache = getattr(params.token_to_kv_pool_allocator, "_kvcache", None)
+            cache = getattr(cache, "full_kv_pool", cache)
+            if getattr(cache, "_kpool_use_compress", False):
+                self.kpool_checkpoint_alignment = int(cache.page_size) * int(cache.index_kpool)
+                params = replace(params, page_size=lcm(params.page_size, self.kpool_checkpoint_alignment))
+
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
@@ -850,6 +860,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
     ) -> None:
+        checkpoint = req.kv.mamba_last_track_seqlen
+        if checkpoint is not None and checkpoint % self.kpool_checkpoint_alignment != 0:
+            is_insert = False
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
@@ -937,6 +950,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(req)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+        checkpoint = req.kv.mamba_last_track_seqlen
+        if not self.disable and checkpoint is not None and checkpoint % self.kpool_checkpoint_alignment:
+            indices = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, :req.extend_range.end
+            ]
+            req.prefix_indices = indices.to(dtype=torch.int64, copy=True)
+            return
+
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
