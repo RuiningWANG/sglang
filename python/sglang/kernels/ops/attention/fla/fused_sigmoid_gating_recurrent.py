@@ -377,6 +377,8 @@ def fused_sigmoid_gating_delta_rule_update(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    *,
+    value_tile: int = 32,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -401,7 +403,9 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[1] if a.ndim == 4 else a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    if value_tile not in (16, 32, 64):
+        raise ValueError(f"Unsupported recurrent value tile: {value_tile}")
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), value_tile)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
