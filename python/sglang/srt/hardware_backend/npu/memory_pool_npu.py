@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
@@ -856,7 +857,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
-        self.tail_extra_slots = tail_extra_slots
+        # The aligned single-token kernel writes before compressing and requires
+        # a pool_size + 1 ring. Speculative workers retain their wider ring.
+        self.tail_extra_slots = (
+            max(1, tail_extra_slots)
+            if zero_mismatch_enabled()
+            and self.kpool_use_compress
+            and self.index_k_store_dtype == torch.bfloat16
+            else tail_extra_slots
+        )
         self.skip_topk_layers = (
             list(skip_topk_layers)
             if skip_topk_layers is not None
@@ -951,7 +960,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
             req_pool_size = max_running_requests + 1
             tail_dtype = torch.bfloat16
-            tail_width = index_kpool + tail_extra_slots
+            tail_width = index_kpool + self.tail_extra_slots
             # get [0, tail_width, index_head_dim] tensor if skipped
             self._compress_tail_k: Optional[List[torch.Tensor]] = [
                 torch.zeros(

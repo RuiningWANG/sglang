@@ -21,7 +21,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -489,12 +488,11 @@ class MultimemAllGatherer:
                 tp_group.world_size > 1
                 and get_parallel().nnodes > 1
                 and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
-            ):
-                if is_cuda() and is_one_nvlink_clique(
+                and not is_one_nvlink_clique(
                     tp_group.cpu_group,
                     torch.device("cuda", torch.cuda.current_device()),
-                ):
-                    return
+                )
+            ):
                 logger.warning(
                     "multimem all-gather disabled because the TP group spans "
                     "nodes outside one NVLink clique."

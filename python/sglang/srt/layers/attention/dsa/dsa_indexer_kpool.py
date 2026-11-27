@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
+
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -1870,10 +1872,22 @@ class IndexerKPool(MultiPlatformOp):
                 device=x.device,
             )
 
-        key, _ = self.wk(x)
-        key = self.k_norm(key)
-        gate_score = F.linear(x, self.index_kpool_compress_gate)
-        query, _ = self.wq_b(q_lora)  # [T,H*D]
+        aligned = zero_mismatch_enabled() and x.dtype == torch.bfloat16 and self.skip_rope
+        if aligned:
+            from sglang.srt.zero_mismatch.indexer import project_rows, project_head_weights
+
+            key = project_rows(x, self.wk.weight)
+            key = F.layer_norm(
+                key.float(), (self.head_dim,), self.k_norm.weight.float(),
+                self.k_norm.bias.float(), self.k_norm.variance_epsilon,
+            ).to(key.dtype)
+            gate_score = project_rows(x, self.index_kpool_compress_gate)
+            query = project_rows(q_lora, self.wq_b.weight)
+        else:
+            key, _ = self.wk(x)
+            key = self.k_norm(key)
+            gate_score = F.linear(x, self.index_kpool_compress_gate)
+            query, _ = self.wq_b(q_lora)  # [T,H*D]
         query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)  # [T,H,D]
         if self.rope_head_dim > 0 and not self.skip_rope:  # with RoPE
             q_rope = query[..., : self.rope_head_dim]
@@ -1904,8 +1918,11 @@ class IndexerKPool(MultiPlatformOp):
 
         # --- Read Phase ---
         # Get model weights. Here only apply 1/sqrt(H). PoolKeyIndexer will apply 1/sqrt(D)
-        weights, _ = self.weights_proj(x.float())  # [T,H]
-        weights = (weights * self.n_heads**-0.5).to(torch.bfloat16).contiguous()
+        if aligned:
+            weights = project_head_weights(x, self.weights_proj.weight, self.n_heads)
+        else:
+            weights, _ = self.weights_proj(x.float())  # [T,H]
+            weights = (weights * self.n_heads**-0.5).to(torch.bfloat16).contiguous()
         return _get_topk_npu(
             layer_id=layer_id,
             query=query,

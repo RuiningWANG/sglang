@@ -1,6 +1,8 @@
 import math
 from typing import Optional
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
+
 import torch
 from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
@@ -145,6 +147,14 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             layer._conv_weights_t = w
         return w
 
+    @staticmethod
+    def _use_aligned_kda(layer: RadixLinearAttention, mixed_qkv: torch.Tensor) -> bool:
+        return (
+            zero_mismatch_enabled()
+            and mixed_qkv.dtype == torch.bfloat16
+            and layer.lower_bound is not None
+        )
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -154,8 +164,11 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         b: torch.Tensor,
         **kwargs,
     ):
-        """Run KDA decode against the native channel-first Ascend cache."""
+        """Run KDA decode against the Ascend cache."""
         assert isinstance(mixed_qkv, torch.Tensor)
+        if self._use_aligned_kda(layer, mixed_qkv):
+            return super().forward_decode(layer, forward_batch, mixed_qkv, a, b, **kwargs)
+
         layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -239,8 +252,14 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         b: torch.Tensor,
         **kwargs,
     ):
-        """Run Ascend prefill without changing the shared KDA backend."""
+        """Run Ascend prefill or the shared deterministic KDA path."""
         assert isinstance(mixed_qkv, torch.Tensor)
+        if (
+            self._use_aligned_kda(layer, mixed_qkv)
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return super().forward_extend(layer, forward_batch, mixed_qkv, a, b, **kwargs)
+
         if forward_batch.forward_mode.is_target_verify():
             return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
 

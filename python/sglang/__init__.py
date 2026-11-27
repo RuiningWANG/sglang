@@ -1,5 +1,8 @@
 """SGLang public API."""
 
+from glm53_zero_mismatch import configure_npu as _configure_glm53_npu
+_configure_glm53_npu()
+
 import platform as _platform
 import sys as _sys
 

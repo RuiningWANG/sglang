@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
+
 from functools import partial
 from typing import Callable, Optional, Tuple
 
@@ -399,6 +401,24 @@ class ExitPolicy:
         if steps.output.transform is not None:
             hidden_states = steps.output.transform.apply(hidden_states)
         if steps.returns_over_dp:
+            if (
+                zero_mismatch_enabled() and hidden_states.device.type == "npu"
+                and hidden_states.dtype == torch.bfloat16
+                and dp_step in (dp_reduce_scatterv, dp_reduce_scatter)
+                and steps.output.update.applied_at_exit and not steps.output.update.is_plain_add
+            ):
+                parallel = get_parallel()
+                if (parallel.tp_size, parallel.attn_dp_size, parallel.moe_ep_size) == (16, 16, 16):
+                    from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+                    from sglang.srt.zero_mismatch.ordered_moe import reduce_rank_order
+
+                    variable = dp_step is dp_reduce_scatterv
+
+                    def ordered_step(local, values, batch):
+                        sizes = get_dp_global_num_tokens() if variable else [local.shape[0]] * parallel.tp_size
+                        local.copy_(reduce_rank_order(values, sizes, parallel.tp_group.device_group))
+
+                    dp_step = ordered_step
             hidden_states = to_dp_local(
                 dp_step or _dp_scatter_step, forward_batch, hidden_states
             )

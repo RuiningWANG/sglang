@@ -656,7 +656,7 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[1] if a.ndim == 4 else a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    use_pdl = is_arch_support_pdl()
+    use_pdl = q.device.type != "npu" and is_arch_support_pdl()
     target_verify = (
         disable_state_update and not match_cutedsl_decode
         if is_kda

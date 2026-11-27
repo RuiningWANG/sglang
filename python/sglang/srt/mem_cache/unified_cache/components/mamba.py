@@ -985,8 +985,15 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        keep_idx = None
         if self.cache.enable_mamba_extra_buffer:
-            cache_len = req.kv.mamba_last_track_seqlen
+            if is_finished:
+                checkpoint = self._select_finished_checkpoint(req, token_ids_len)
+                if checkpoint is None:
+                    return 0
+                cache_len, keep_idx = checkpoint
+            else:
+                cache_len = req.kv.mamba_last_track_seqlen
         else:
             cache_len = token_ids_len
             # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by the
@@ -998,14 +1005,12 @@ class MambaComponent(TreeComponent):
                 storage, sub_pool = self._state()
                 cache_len -= storage.settle_replay(sub_pool, req.kv.mamba_pool_idx)
 
+        alignment = getattr(self.cache, "glm53_kpool_alignment", 1)
+        if cache_len is None or cache_len % alignment:
+            return 0
+
         if is_finished:
-            if cache_len is None:
-                cache_len = 0
-            if self.cache.enable_mamba_extra_buffer:
-                checkpoint = self._select_finished_checkpoint(req, token_ids_len)
-                if checkpoint is None:
-                    return 0
-                cache_len, keep_idx = checkpoint
+            if keep_idx is not None:
                 if not self._mamba_host_only_checkpoint():
                     insert_params.mamba_keep_idx = keep_idx
                 active_value = (
@@ -1022,8 +1027,6 @@ class MambaComponent(TreeComponent):
                 insert_params.mamba_value = active_value
             return cache_len
         else:
-            if cache_len is None:
-                return 0
             if self._defers_checkpoint(req, token_ids_len, cache_len):
                 insert_params.mamba_checkpoint_deferred = True
                 return 0

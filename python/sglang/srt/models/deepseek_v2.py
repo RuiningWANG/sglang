@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
+
 import logging
 from contextlib import contextmanager, nullcontext
 from functools import cached_property
@@ -484,6 +486,10 @@ class DeepseekV2MLP(nn.Module):
         elif self.swiglu_limit is not None:
             if _is_hip:
                 x = _hip_act.silu_and_mul_clamp(self, gate_up)
+            elif _is_npu and zero_mismatch_enabled() and gate_up.dtype == torch.bfloat16:
+                from sglang.srt.hardware_backend.npu.moe.activation import NPUSwigluWithLimit
+
+                x, _ = NPUSwigluWithLimit(self.swiglu_limit)._apply_activation(gate_up)
             elif _is_npu:
                 x = torch.ops.npu.npu_clipped_swiglu(
                     gate_up,
@@ -570,6 +576,15 @@ class MoEGate(nn.Module):
         if self.weight.dtype == torch.float32:
             return F.linear(hidden_states.float(), self.weight)
 
+        if (
+            _is_npu
+            and zero_mismatch_enabled()
+            and hidden_states.dtype == self.weight.dtype == torch.bfloat16
+            and self.weight.shape[0] == 288
+        ):
+            # Match the EP16 trainer's BF16 GEMM result before FP32 TopK.
+            return F.linear(hidden_states, self.weight, None).float()
+
         if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,
@@ -649,6 +664,9 @@ def _scale_routed_and_add_shared(
     if shared is not None:
         if fused_in_topk:
             return shared.add_(routed)
+        if zero_mismatch_enabled() and routed.device.type == "npu" and routed.dtype == torch.bfloat16:
+            # Match the EP16 trainer: round the scaled routed partial before adding the shared partial.
+            return routed * routed_scaling_factor + shared
         return shared.add_(routed, alpha=routed_scaling_factor)
     if not fused_in_topk:
         routed *= routed_scaling_factor

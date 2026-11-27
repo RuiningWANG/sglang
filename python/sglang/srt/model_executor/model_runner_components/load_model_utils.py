@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = int(os.environ.get("SGLANG_MODEL_LOADING_TIMEOUT_S", "480"))
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 
 def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
