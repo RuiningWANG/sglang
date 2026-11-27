@@ -362,6 +362,23 @@ class GlmImageAR(PipelineStage):
                 e,
             )
             raise
+        except requests.HTTPError as e:
+            # HTTPError alone omits the server's request-validation details.
+            response = e.response
+            if response is not None:
+                logger.error(
+                    "SGLang encoder at %s returned HTTP %s: %s",
+                    server_args.srt_encoder_url,
+                    response.status_code,
+                    response.text[:2000],
+                )
+            else:
+                logger.error(
+                    "SGLang encoder at %s failed with no response: %s",
+                    server_args.srt_encoder_url,
+                    e,
+                )
+            raise
         except requests.RequestException as e:
             logger.error(
                 "SGLang encoder request to %s failed: %s",
@@ -408,7 +425,7 @@ class GlmImageAR(PipelineStage):
 
         Args:
             prompt: The text prompt with shape info (e.g., "description<sop>36 24<eop>")
-            condition_images: Optional list of condition images for i2i
+            image: Optional list of condition images for i2i
 
         Returns:
             Tuple of the D16 prior token IDs, optional source-image token IDs,
@@ -905,14 +922,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             else 8
         )
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
-
-        self.default_sample_size = (
-            self.transformer.config.sample_size
-            if hasattr(self, "transformer")
-            and self.transformer is not None
-            and hasattr(self.transformer.config, "sample_size")
-            else 128
-        )
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None

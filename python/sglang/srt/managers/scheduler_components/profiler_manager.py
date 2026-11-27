@@ -4,7 +4,7 @@ import gc
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -17,14 +17,15 @@ from typing import (
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
+from sglang.srt.observability.profile_utils import ProfileManager
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_device
+from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.srt.utils.profile_utils import ProfileManager
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
@@ -51,14 +52,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass(kw_only=True)
 class SchedulerProfilerManager:
-    ps: Any
-    dp_tp_cpu_group: Any
     get_forward_ct: Callable[[], int]
+    # Taken at construction: a batch can stop profiling while a scoped
+    # override has moved the TP group.
+    dp_tp_cpu_group: Any = field(init=False)
 
     def __post_init__(self) -> None:
+        self.dp_tp_cpu_group = get_dp_tp_group().cpu_group
+        self._rank_profile_req: Optional[ProfileReq] = None
+        self._rank_profile_stage: Optional[str] = None
+        self._rank_profile_remaining: dict[str, int] = {}
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
-                ps=self.ps,
                 cpu_group=self.dp_tp_cpu_group,
             )
             return
@@ -207,10 +212,13 @@ class SchedulerProfilerManager:
 
             self.rpd_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
-                "rpd-" + str(time.time()) + f"-TP-{self.ps.tp_rank}" + ".trace.json.gz",
+                "rpd-"
+                + str(time.time())
+                + f"-TP-{get_parallel().tp_rank}"
+                + ".trace.json.gz",
             )
 
-            if self.ps.tp_rank == 0:
+            if get_parallel().tp_rank == 0:
                 import sqlite3
 
                 from rocpd.schema import RocpdSchema
@@ -234,11 +242,12 @@ class SchedulerProfilerManager:
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,
+                profile_memory=self._rank_profile_req is not None,
                 on_trace_ready=(
                     None
                     if not _is_npu
                     else torch_npu.profiler.tensorboard_trace_handler(
-                        str(self.torch_profiler_output_dir)
+                        str(self.torch_profiler_output_dir / (self._rank_profile_stage or ""))
                     )
                 ),
                 experimental_config=(
@@ -271,7 +280,7 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
-            if self.ps.gpu_id == get_device().base_gpu_id:
+            if get_device().gpu_id == get_device().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
@@ -282,13 +291,13 @@ class SchedulerProfilerManager:
         if not self.merge_profiles:
             return ""
 
-        if self.ps.tp_rank != 0:
+        if get_parallel().tp_rank != 0:
             return ""
-        if self.ps.dp_size > 1 and self.ps.dp_rank != 0:
+        if get_parallel().num_dp_ranks > 1 and get_parallel().dp_rank != 0:
             return ""
-        if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
+        if get_parallel().pp_size > 1 and get_parallel().pp_rank != 0:
             return ""
-        if self.ps.moe_ep_size > 1 and self.ps.moe_ep_rank != 0:
+        if get_parallel().moe_ep_size > 1 and get_parallel().moe_ep_rank != 0:
             return ""
 
         try:
@@ -336,15 +345,15 @@ class SchedulerProfilerManager:
             self.torch_profiler.stop()
             if not _is_npu:
                 # Build filename with only non-zero ranks to maintain backward compatibility
-                filename_parts = [self.profile_id, f"TP-{self.ps.tp_rank}"]
+                filename_parts = [self.profile_id, f"TP-{get_parallel().tp_rank}"]
 
                 # Only add other ranks if parallelism is enabled (size > 1)
-                if self.ps.dp_size > 1:
-                    filename_parts.append(f"DP-{self.ps.dp_rank}")
-                if self.ps.pp_size > 1:
-                    filename_parts.append(f"PP-{self.ps.pp_rank}")
-                if self.ps.moe_ep_size > 1:
-                    filename_parts.append(f"EP-{self.ps.moe_ep_rank}")
+                if get_parallel().num_dp_ranks > 1:
+                    filename_parts.append(f"DP-{get_parallel().dp_rank}")
+                if get_parallel().pp_size > 1:
+                    filename_parts.append(f"PP-{get_parallel().pp_rank}")
+                if get_parallel().moe_ep_size > 1:
+                    filename_parts.append(f"EP-{get_parallel().moe_ep_rank}")
 
                 filename = (
                     stage_prefix
@@ -356,7 +365,8 @@ class SchedulerProfilerManager:
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            if self._rank_profile_req is None:
+                torch.distributed.barrier(self.dp_tp_cpu_group)
 
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()
@@ -364,7 +374,7 @@ class SchedulerProfilerManager:
             self.rpd_profiler.flush()
 
             torch.distributed.barrier(self.dp_tp_cpu_group)
-            if self.ps.tp_rank == 0:
+            if get_parallel().tp_rank == 0:
                 from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
                 rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
@@ -376,7 +386,7 @@ class SchedulerProfilerManager:
                 self.torch_profiler_output_dir,
                 stage_prefix
                 + str(time.time())
-                + f"-TP-{self.ps.tp_rank}-memory"
+                + f"-TP-{get_parallel().tp_rank}-memory"
                 + stage_suffix
                 + ".pickle",
             )
@@ -384,7 +394,7 @@ class SchedulerProfilerManager:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            if self.ps.gpu_id == get_device().base_gpu_id:
+            if get_device().gpu_id == get_device().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()
@@ -405,7 +415,34 @@ class SchedulerProfilerManager:
         self._apply_detailed_annotations(False)
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
+    def _sample_rank_profile(self, batch: ScheduleBatch):
+        if get_parallel().tp_rank != self._rank_profile_req.npu_profile_tp_rank:
+            return
+
+        mode = batch.forward_mode
+        stage = None
+        if mode.is_prefill():
+            stage = "prefill"
+        elif mode.is_decode():
+            stage = "decode"
+        if not self._rank_profile_remaining.get(stage, 0):
+            stage = None
+        if stage != self._rank_profile_stage:
+            if self.profile_in_progress:
+                self._stop_profile()
+            self._rank_profile_stage = stage
+            if stage is not None:
+                status = self._start_profile(mode)
+                if not status.success:
+                    raise RuntimeError(status.message)
+        if stage is not None:
+            self._rank_profile_remaining[stage] -= 1
+
     def _profile_batch_predicate(self, batch: ScheduleBatch):
+        if self._rank_profile_req is not None:
+            self._sample_rank_profile(batch)
+            return
+
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager.step(forward_mode=batch.forward_mode)
             return
@@ -421,14 +458,20 @@ class SchedulerProfilerManager:
             elif batch.forward_mode.is_decode():
                 if self.profiler_decode_ct == 0:
                     if self.profile_in_progress:
-                        # force trace flush
+                        # force trace flush (a prefill capture must not absorb decode steps)
                         self._stop_profile(stage=ForwardMode.EXTEND)
+                    min_bs = envs.SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS.get()
+                    if min_bs > 0 and batch.batch_size() < min_bs:
+                        # Wait for full admission before capturing the decode stage
+                        return
                     self._start_profile(batch.forward_mode)
                 self.profiler_decode_ct += 1
                 if self.profiler_decode_ct > self.profiler_target_decode_ct:
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.DECODE)
-            elif batch.forward_mode.is_idle():
+            elif batch.forward_mode.is_idle() or batch.forward_mode.is_prebuilt():
+                # PREBUILT is the disaggregated-decode placeholder for requests
+                # whose KV just arrived; it never enters a model forward.
                 pass
             else:
                 raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
@@ -446,7 +489,32 @@ class SchedulerProfilerManager:
                 self._start_profile()
 
     def _profile(self, recv_req: ProfileReq):
+        if self._rank_profile_req is not None:
+            if recv_req.req_type == ProfileReqType.START_PROFILE:
+                return ProfileReqOutput(success=False, message="A rank profile is already armed")
+            if self.profile_in_progress:
+                self._stop_profile()
+            self._rank_profile_req = None
+            self._rank_profile_stage = None
+            self._rank_profile_remaining.clear()
+            return ProfileReqOutput(success=True, message="Stopped rank profile")
+
         if recv_req.req_type == ProfileReqType.START_PROFILE:
+            if recv_req.npu_profile_tp_rank is not None:
+                if not (
+                    _is_npu and not envs.SGLANG_PROFILE_V2.get()
+                    and recv_req.profile_by_stage and recv_req.num_steps and recv_req.num_steps > 0
+                    and 0 <= recv_req.npu_profile_tp_rank < get_parallel().tp_size
+                ):
+                    return ProfileReqOutput(success=False, message="Invalid stage-bounded NPU rank profile")
+                result = self._init_profile(
+                    recv_req.output_dir, None, None, recv_req.activities,
+                    recv_req.with_stack, recv_req.record_shapes, False, recv_req.profile_id,
+                )
+                if result.success:
+                    self._rank_profile_req = recv_req
+                    self._rank_profile_remaining = dict.fromkeys(("prefill", "decode"), recv_req.num_steps)
+                return result
             if recv_req.profile_by_stage or recv_req.start_step:
                 return self._init_profile(
                     recv_req.output_dir,

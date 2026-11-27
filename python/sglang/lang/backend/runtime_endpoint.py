@@ -6,6 +6,8 @@ import warnings
 from typing import Dict, List, Optional, Union
 
 import aiohttp
+import msgspec
+import msgspec.structs
 import requests
 
 from sglang.lang.backend.base_backend import BaseBackend
@@ -20,6 +22,7 @@ from sglang.lang.ir import (
     REGEX_STR,
     SglSamplingParams,
 )
+from sglang.srt.environ import envs
 from sglang.utils import http_request
 
 
@@ -30,12 +33,14 @@ class RuntimeEndpoint(BaseBackend):
         api_key: Optional[str] = None,
         verify: Optional[str] = None,
         chat_template_name: Optional[str] = None,
+        admin_api_key: Optional[str] = None,
     ):
         super().__init__()
         self.support_concate_and_append = True
 
         self.base_url = base_url
         self.api_key = api_key
+        self.admin_api_key = admin_api_key or envs.SGLANG_ADMIN_API_KEY.get()
         self.verify = verify
 
         res = http_request(
@@ -59,7 +64,7 @@ class RuntimeEndpoint(BaseBackend):
     def flush_cache(self):
         res = http_request(
             self.base_url + "/flush_cache",
-            api_key=self.api_key,
+            api_key=self.admin_api_key or self.api_key,
             verify=self.verify,
             method="POST",
         )
@@ -89,7 +94,7 @@ class RuntimeEndpoint(BaseBackend):
     def start_profile(self):
         res = http_request(
             self.base_url + "/start_profile",
-            api_key=self.api_key,
+            api_key=self.admin_api_key or self.api_key,
             verify=self.verify,
         )
         self._assert_success(res)
@@ -97,7 +102,7 @@ class RuntimeEndpoint(BaseBackend):
     def stop_profile(self):
         res = http_request(
             self.base_url + "/stop_profile",
-            api_key=self.api_key,
+            api_key=self.admin_api_key or self.api_key,
             verify=self.verify,
         )
         self._assert_success(res)
@@ -383,7 +388,12 @@ class Runtime:
         # Pre-allocate a port before building the config, so the config is born
         # with the port this runtime will serve on.
         requested_port = kwargs.pop(
-            "port", ServerArgs.__dataclass_fields__["port"].default
+            "port",
+            next(
+                f.default
+                for f in msgspec.structs.fields(ServerArgs)
+                if f.name == "port"
+            ),
         )
         for port in range(requested_port, 40000):
             if is_port_available(port):
@@ -433,7 +443,11 @@ class Runtime:
                 self.shutdown()
                 raise TimeoutError("Server failed to start within the timeout period.")
 
-        self.endpoint = RuntimeEndpoint(self.url)
+        self.endpoint = RuntimeEndpoint(
+            self.url,
+            api_key=self.server_args.api_key,
+            admin_api_key=self.server_args.admin_api_key,
+        )
 
     def shutdown(self):
         from sglang.srt.utils import kill_process_tree
@@ -454,8 +468,8 @@ class Runtime:
         self.endpoint.cache_prefix(prefix)
 
     def get_tokenizer(self):
-        from sglang.srt.arg_groups.overrides import resolving_view
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.hf_transformers import get_tokenizer
 
         cfg = resolving_view(self.server_args)
         return get_tokenizer(

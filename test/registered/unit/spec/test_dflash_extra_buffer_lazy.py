@@ -13,9 +13,9 @@ from sglang.srt.arg_groups.mamba_hook import validate_mamba_extra_buffer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.speculative import dflash_info
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -48,7 +48,7 @@ class TestValidateMambaExtraBufferLazyDflash(CustomTestCase):
         with override_platform(is_cuda=True):
             validate_mamba_extra_buffer(
                 view,
-                "Qwen3NextForCausalLM",
+                SimpleNamespace(architectures=["Qwen3NextForCausalLM"]),
                 mamba_cache_chunk_size_of=lambda: 64,
             )
 
@@ -58,8 +58,8 @@ class TestValidateMambaExtraBufferLazyDflash(CustomTestCase):
     def test_dspark_still_accepted(self):
         self._validate(_lazy_view(speculative_algorithm="DSPARK"))
 
-    def test_pd_disaggregation_still_rejected(self):
-        with self.assertRaisesRegex(AssertionError, "PD disaggregation"):
+    def test_pd_decode_still_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "PD decode worker"):
             self._validate(_lazy_view(disaggregation_mode="decode"))
 
     def test_track_interval_must_cover_draft_tokens(self):
@@ -82,7 +82,7 @@ class TestValidateMambaExtraBufferLazyDflash(CustomTestCase):
         with override_platform(is_cuda=True):
             validate_mamba_extra_buffer(
                 _lazy_view(page_size=None),
-                "Qwen3NextForCausalLM",
+                SimpleNamespace(architectures=["Qwen3NextForCausalLM"]),
                 mamba_cache_chunk_size_of=_must_not_be_read,
             )
 
@@ -120,7 +120,9 @@ class TestDflashVerifyRunsMambaTrackHook(CustomTestCase):
             calls.append("init_new")
             return fake_forward_batch
 
+        # This test covers the generic/CUDA hook ordering, not NPU DSV4 bundle setup.
         with (
+            mock.patch.object(dflash_info, "_is_npu", False),
             mock.patch(
                 "sglang.srt.speculative.spec_utils.prepare_mamba_track_for_verify",
                 side_effect=fake_hook,

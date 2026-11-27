@@ -11,12 +11,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.utils import seqlens_expand_triton
+from sglang.kernels.ops.attention.pad import seqlens_expand_triton
 from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -123,17 +123,8 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
 
         if (
-            _is_cuda
-            and not _is_hip
-            and (
-                self.dsa_index_kpool <= 1
-                or getattr(self, "experimental_kpool_metadata_fusion", False)
-            )
-        ):
-            from sglang.kernels.ops.attention.dsa_metadata import (
-                fused_dsa_decode_metadata,
-            )
-
+            (_is_cuda or _is_hip) and self.dsa_index_kpool <= 1
+        ) or self.experimental_kpool_metadata_fusion:
             cache_seqlens = torch.empty(bs, dtype=torch.int32, device=self.device)
             cu_seqlens_k = torch.empty(bs + 1, dtype=torch.int32, device=self.device)
             page_indices = torch.empty(
@@ -143,8 +134,10 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             dsa_cu_seqlens_k = torch.empty(
                 bs + 1, dtype=torch.int32, device=self.device
             )
-            if self.real_page_size > 1:
-                real_cols = (max_len + self.real_page_size - 1) // self.real_page_size
+            if self.physical_page_size > 1:
+                real_cols = (
+                    max_len + self.physical_page_size - 1
+                ) // self.physical_page_size
                 real_page_table = torch.empty(
                     (bs, real_cols), dtype=torch.int32, device=self.device
                 )
@@ -153,7 +146,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 real_page_table = None
                 real_page_table_arg = page_indices
 
-            fused_dsa_decode_metadata(
+            self._fused_decode_metadata(
                 seq_lens=seq_lens,
                 req_pool_indices=req_pool_indices,
                 req_to_token=self.req_to_token,
@@ -166,8 +159,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 bs=bs,
                 max_len=max_len,
                 dsa_index_topk=self.dsa_index_topk,
-                real_page_size=self.real_page_size,
-                index_kpool=self.dsa_index_kpool,
+                physical_page_size=self.real_page_span,
             )
             seqlens_expanded = cache_seqlens
             seqlens_expanded_size = bs
@@ -214,7 +206,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
 
         # Transform page table if needed
-        if self.real_page_size > 1:
+        if self.physical_page_size > 1:
             real_page_table = self._transform_table_1_to_real(page_indices)
         else:
             real_page_table = None  # Will use page_indices directly
@@ -253,11 +245,9 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         max_seqlen_k = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
         seqlens_expanded_size = bs * self.speculative_num_draft_tokens
 
-        if _is_cuda and not _is_hip and self.dsa_index_kpool <= 1:
-            from sglang.kernels.ops.attention.dsa_metadata import (
-                fused_dsa_target_verify_metadata,
-            )
-
+        if (
+            (_is_cuda or _is_hip) and self.dsa_index_kpool <= 1
+        ) or self.experimental_kpool_metadata_fusion:
             cache_seqlens = torch.empty(bs, dtype=torch.int32, device=self.device)
             cu_seqlens_k = torch.empty(bs + 1, dtype=torch.int32, device=self.device)
             page_indices = torch.empty(
@@ -276,10 +266,10 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 dtype=torch.int32,
                 device=self.device,
             )
-            if self.real_page_size > 1:
+            if self.physical_page_size > 1:
                 real_cols = (
-                    max_seqlen_k + self.real_page_size - 1
-                ) // self.real_page_size
+                    max_seqlen_k + self.physical_page_size - 1
+                ) // self.physical_page_size
                 real_page_table = torch.empty(
                     (seqlens_expanded_size, real_cols),
                     dtype=torch.int32,
@@ -290,7 +280,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 real_page_table = None
                 real_page_table_arg = page_indices
 
-            fused_dsa_target_verify_metadata(
+            self._fused_verify_metadata(
                 seq_lens=seq_lens,
                 req_pool_indices=req_pool_indices,
                 req_to_token=self.req_to_token,
@@ -304,7 +294,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 bs=bs,
                 max_seqlen_k=max_seqlen_k,
                 dsa_index_topk=self.dsa_index_topk,
-                real_page_size=self.real_page_size,
+                physical_page_size=self.real_page_span,
                 next_n=self.speculative_num_draft_tokens,
             )
 
@@ -367,7 +357,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
 
         # Transform page table
-        if self.real_page_size > 1:
+        if self.physical_page_size > 1:
             real_page_table = self._transform_table_1_to_real(page_indices)
         else:
             real_page_table = None
@@ -394,9 +384,3 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             max_seqlen_k=max_seqlen_k,
             flashmla_metadata=flashmla_metadata,
         )
-
-
-# Backward-compat alias
-DeepseekSparseAttnBackendMTPPrecomputeMixin = (
-    DeepseekSparseAttnBackendMTPPrecomputeMixin
-)
