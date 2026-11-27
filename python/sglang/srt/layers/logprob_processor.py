@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
+
 import bisect
 import dataclasses
 import logging
@@ -500,6 +502,8 @@ class InputLogprobProcessor:
             envs.SGLANG_ENABLE_FAST_INPUT_LOGPROBS.get()
             and not _deterministic_inference_enabled()
         )
+        if zero_mismatch_enabled():
+            self.enable_fast_input_logprobs = False
 
     def forward(
         self,

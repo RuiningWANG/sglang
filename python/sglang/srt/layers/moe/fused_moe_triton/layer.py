@@ -182,20 +182,26 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
-def _validate_ascend_no_a2a_layout(moe_runner_config: MoeRunnerConfig) -> None:
-    """Reject the one layout the Ascend no-A2A routing cannot express.
+def _validate_ascend_no_a2a_layout(
+    moe_runner_config: MoeRunnerConfig, quant_method: FusedMoEMethodBase
+) -> None:
+    """Admit full weights or the explicitly supported local GLM5.3 layout.
 
-    The routing op indexes the checkpoint's full expert space, and the grouped
-    matmuls consume that same range, so every rank must hold all experts.
-    With ``ep_size > 1`` the community dispatcher rewrites the top-k ids to
-    rank-local ones while the Ascend kernels would still index the global
-    range; route that configuration to a backend that implements EP instead of
-    silently mismatching experts.
+    Other EP configurations still need a backend that implements their
+    dispatch and matching expert weight placement.
     """
     if get_parallel().dwdp_size > 1:
         # DWDP collapses the EP view onto full weights after construction.
         return
     if moe_runner_config.num_local_experts == moe_runner_config.num_experts:
+        return
+    from sglang.srt.zero_mismatch.moe_layout import use_local_ep16
+
+    if isinstance(quant_method, UnquantizedFusedMoEMethod) and use_local_ep16(
+        moe_runner_config, get_parallel()
+    ):
+        # StandardDispatcher has already mapped routes to the 18 local IDs.
+        # The Ascend runner uses that same expert range for its grouped matmuls.
         return
     raise ValueError(
         "Expert parallelism (ep_size > 1) is not supported on Ascend NPU with "
@@ -229,7 +235,7 @@ def create_moe_dispatcher(
         # weighted unpermute) runs in the MoE runner's permute hooks, see
         # moe_runner/ascend.py.
         if _is_npu and a2a_backend.is_none():
-            _validate_ascend_no_a2a_layout(moe_runner_config)
+            _validate_ascend_no_a2a_layout(moe_runner_config, quant_method)
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()

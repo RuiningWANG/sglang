@@ -1,3 +1,5 @@
+
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
 import importlib.util
 from typing import Optional, Tuple, Union
 
@@ -973,17 +975,43 @@ class KDAAttnBackend(MambaAttnBackendBase):
                         f"b {tuple(b.shape)}, indices {cache_indices.dtype}"
                     )
 
-        qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_states.transpose(-1, -2),
-            layer.conv_weights,
-            layer.bias,
-            activation="silu",
-            conv_state_indices=cache_indices,
+        conv_weights = (
+            layer.conv_weights.to(mixed_qkv.dtype) if is_npu() else layer.conv_weights
         )
+        per_sequence_decode = (
+            is_npu() and layer.lower_bound is not None
+            and zero_mismatch_enabled()
+        )
+        if per_sequence_decode:
+            if not getattr(self, "_bi_sequence_decode_logged", False):
+                rank0_log("GLM53 BI KDA decode uses per-sequence convolution and recurrence")
+                self._bi_sequence_decode_logged = True
+            if mixed_qkv.shape[0] != cache_indices.numel() or ssm_states.dtype != torch.float32:
+                raise RuntimeError("Per-sequence NPU decode requires one live token per slot and fp32 state")
+            # Decode offsets already live on device. The cached arange also
+            # preserves [0, 1] when graph replay pads the request metadata.
+            decode_offsets = self.cached_cuda_graph_decode_query_start_loc
+            offsets = (decode_offsets if decode_offsets is not None else query_start_loc)[:2]
+            qkv = torch.cat([
+                _static_kda_conv_step(
+                    mixed_qkv[index:index + 1],
+                    conv_weights, layer.bias, conv_states.transpose(-1, -2),
+                    cache_indices[index:index + 1], offsets,
+                )
+                for index in range(cache_indices.numel())
+            ], dim=0)
+        else:
+            qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states.transpose(-1, -2),
+                conv_weights,
+                layer.bias,
+                activation="silu",
+                conv_state_indices=cache_indices,
+            )
 
         # The packed kernel assumes one token per request.
-        if self.kernel_dispatcher.supports_packed_decode and (
+        if not per_sequence_decode and self.kernel_dispatcher.supports_packed_decode and (
             getattr(layer, "lower_bound", None) is None
             or self.kernel_dispatcher.supports_packed_decode_safe_gate
         ):
@@ -1019,19 +1047,36 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
-        core_attn_out = self.kernel_dispatcher.decode(
-            q=q,
-            k=k,
-            v=v,
-            a=a,
-            b=b,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            lower_bound=layer.lower_bound,
-        )
+        if per_sequence_decode:
+            gate = a.unsqueeze(0) if a.ndim == 2 else a
+            beta = b.unsqueeze(0) if b.ndim == 2 else b
+            core_attn_out = torch.cat([
+                self.kernel_dispatcher.decode(
+                    q=q[:, index:index + 1].contiguous(),
+                    k=k[:, index:index + 1].contiguous(),
+                    v=v[:, index:index + 1].contiguous(),
+                    a=gate[:, index:index + 1].contiguous(),
+                    b=beta[:, index:index + 1].contiguous(),
+                    A_log=layer.A_log, dt_bias=layer.dt_bias, ssm_states=ssm_states,
+                    cache_indices=cache_indices[index:index + 1],
+                    query_start_loc=offsets, lower_bound=layer.lower_bound,
+                )
+                for index in range(cache_indices.numel())
+            ], dim=1)
+        else:
+            core_attn_out = self.kernel_dispatcher.decode(
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                lower_bound=layer.lower_bound,
+            )
 
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
@@ -1056,9 +1101,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             and layer.q_dim == layer.k_dim == layer.v_dim
             else 0
         )
-        conv_output = causal_conv1d_fn(
+        conv = causal_conv1d_fn
+        weights = layer.conv_weights
+        if is_npu() and zero_mismatch_enabled():
+            from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_fn_npu
+
+            conv = causal_conv1d_fn_npu
+            weights = weights.to(mixed_qkv.dtype)
+        conv_output = conv(
             mixed_qkv.transpose(0, 1),
-            layer.conv_weights,
+            weights,
             layer.bias,
             activation="silu",
             conv_states=conv_states,
@@ -1172,84 +1224,92 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if a.ndim == 3:
             a = a.unflatten(-1, (-1, layer.head_k_dim))
 
-        track_ssm = self.forward_metadata.has_mamba_track_mask
-        track_chunk_idx = self.forward_metadata.track_chunk_idx
-        h_track_buf = None
         if (
-            track_ssm
-            and track_chunk_idx is not None
-            # Same rows as track_ssm_h_batch_src, but known without a GPU sync.
-            and self.forward_metadata.track_ssm_h_src.numel() > 0
+            zero_mismatch_enabled() and is_npu() and layer.lower_bound is not None
+            and not forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            # fp32 scratch the kernel snapshots the tracked chunk-boundary
-            # states into (rows follow the batch; untracked rows stay unread).
-            # A kernel that does not declare support would leave the buffer
-            # unwritten and corrupt prefix-cache restores — fail loudly here.
-            # Check the kernel the dispatcher will actually run (safe-gate
-            # reroute included), not just the configured one.
-            extend_kernel = self.kernel_dispatcher.effective_extend_kernel(
-                layer.lower_bound, q.shape[1], query_start_loc.numel() - 1
+            core_attn_out = self._zero_mismatch_prefill(
+                layer, forward_batch, q, k, v, a, b, ssm_states, cache_indices, query_start_loc
             )
-            assert extend_kernel.supports_track_state_snapshot, (
-                f"{type(extend_kernel).__name__} cannot write the fp32 track "
-                f"snapshot required by the mamba track path; use "
-                f"--linear-attn-prefill-backend triton or "
-                f"--mamba-radix-cache-strategy no_buffer"
+        else:
+            track_ssm = self.forward_metadata.has_mamba_track_mask
+            track_chunk_idx = self.forward_metadata.track_chunk_idx
+            h_track_buf = None
+            if (
+                track_ssm
+                and track_chunk_idx is not None
+                # Same rows as track_ssm_h_batch_src, but known without a GPU sync.
+                and self.forward_metadata.track_ssm_h_src.numel() > 0
+            ):
+                # fp32 scratch the kernel snapshots the tracked chunk-boundary
+                # states into (rows follow the batch; untracked rows stay unread).
+                # A kernel that does not declare support would leave the buffer
+                # unwritten and corrupt prefix-cache restores — fail loudly here.
+                # Check the kernel the dispatcher will actually run (safe-gate
+                # reroute included), not just the configured one.
+                extend_kernel = self.kernel_dispatcher.effective_extend_kernel(
+                    layer.lower_bound, q.shape[1], query_start_loc.numel() - 1
+                )
+                assert extend_kernel.supports_track_state_snapshot, (
+                    f"{type(extend_kernel).__name__} cannot write the fp32 track "
+                    f"snapshot required by the mamba track path; use "
+                    f"--linear-attn-prefill-backend triton or "
+                    f"--mamba-radix-cache-strategy no_buffer"
+                )
+                h_track_buf = torch.empty(
+                    (track_chunk_idx.shape[0], *ssm_states.shape[1:]),
+                    dtype=torch.float32,
+                    device=ssm_states.device,
+                )
+            core_attn_out = self.kernel_dispatcher.extend(
+                q=q,
+                k=k,
+                v=v,
+                g=a,
+                beta=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                query_start_loc_i64=self.forward_metadata.query_start_loc_i64,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                lower_bound=layer.lower_bound,
+                beta_is_raw=True,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                extend_prefix_lens=forward_batch.extend_prefix_lens,
+                layer_id=layer.layer_id,
+                # draft_extend_v2 must stay rollback-able, so kernels that commit state
+                # in place (e.g. FlashKDA) must not run for it.
+                is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
+                return_intermediate_states=track_ssm,
+                # Which global chunk rows of h the track snapshot will read; lets
+                # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
+                # fast path when the snapshot only needs the final state.
+                track_ssm_h_src=(
+                    self.forward_metadata.track_ssm_h_src if track_ssm else None
+                ),
+                track_state=h_track_buf,
+                track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
+                state_checkpoint_cu_starts=self.forward_metadata.state_checkpoint_cu_starts,
+                num_state_checkpoints=self.forward_metadata.num_state_checkpoints,
+                state_checkpoint_every_n_tokens=(
+                    self.forward_metadata.state_checkpoint_every_n_tokens
+                ),
+                state_checkpoint_indices=self.forward_metadata.state_checkpoint_indices,
+                track_ssm_h_batch_src=self.forward_metadata.track_ssm_h_batch_src,
             )
-            h_track_buf = torch.empty(
-                (track_chunk_idx.shape[0], *ssm_states.shape[1:]),
-                dtype=torch.float32,
-                device=ssm_states.device,
-            )
-        core_attn_out = self.kernel_dispatcher.extend(
-            q=q,
-            k=k,
-            v=v,
-            g=a,
-            beta=b,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            query_start_loc_i64=self.forward_metadata.query_start_loc_i64,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            lower_bound=layer.lower_bound,
-            beta_is_raw=True,
-            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            extend_prefix_lens=forward_batch.extend_prefix_lens,
-            layer_id=layer.layer_id,
-            # draft_extend_v2 must stay rollback-able, so kernels that commit state
-            # in place (e.g. FlashKDA) must not run for it.
-            is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
-            return_intermediate_states=track_ssm,
-            # Which global chunk rows of h the track snapshot will read; lets
-            # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
-            # fast path when the snapshot only needs the final state.
-            track_ssm_h_src=(
-                self.forward_metadata.track_ssm_h_src if track_ssm else None
-            ),
-            track_state=h_track_buf,
-            track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
-            state_checkpoint_cu_starts=self.forward_metadata.state_checkpoint_cu_starts,
-            num_state_checkpoints=self.forward_metadata.num_state_checkpoints,
-            state_checkpoint_every_n_tokens=(
-                self.forward_metadata.state_checkpoint_every_n_tokens
-            ),
-            state_checkpoint_indices=self.forward_metadata.state_checkpoint_indices,
-            track_ssm_h_batch_src=self.forward_metadata.track_ssm_h_batch_src,
-        )
-        if track_ssm:
-            # Snapshot the SSM state at the last track-aligned chunk boundary
-            # from the kernel's per-chunk states (h) / final states into the
-            # ping-pong track slots (see _init_track_ssm_indices).
-            core_attn_out, h = core_attn_out
-            self._track_mamba_state_extend(
-                forward_batch,
-                h,
-                ssm_states,
-                self.forward_metadata,
-                h_track_buf=h_track_buf,
-            )
+            if track_ssm:
+                # Snapshot the SSM state at the last track-aligned chunk boundary
+                # from the kernel's per-chunk states (h) / final states into the
+                # ping-pong track slots (see _init_track_ssm_indices).
+                core_attn_out, h = core_attn_out
+                self._track_mamba_state_extend(
+                    forward_batch,
+                    h,
+                    ssm_states,
+                    self.forward_metadata,
+                    h_track_buf=h_track_buf,
+                )
 
         if logical_num_tokens < physical_num_tokens:
             pad = core_attn_out.new_zeros(
@@ -1272,6 +1332,52 @@ class KDAAttnBackend(MambaAttnBackendBase):
             self.accept_lens_pool[slots] = 1
 
         return core_attn_out
+
+    def _zero_mismatch_prefill(self, layer, batch, q, k, v, a, b, states, slots, offsets):
+        from sglang.srt.zero_mismatch.kda_radix import snapshot_prefix_lengths
+
+        lengths = tuple(int(n) for n in batch.extend_seq_lens_cpu)
+        if states.dtype != torch.float32 or sum(lengths) != q.shape[1] or len(lengths) != slots.numel():
+            raise RuntimeError("Aligned KDA prefill requires matching packed metadata and FP32 state")
+        checkpoints = {}
+        if self.forward_metadata.has_mamba_track_mask:
+            mask = batch.mamba_prefill_track_mask_cpu
+            tags = batch.mamba_track_seqlens_cpu
+            if mask is None or tags is None:
+                mask = batch.mamba_track_mask.cpu().tolist()
+                tags = batch.mamba_track_seqlens.cpu().tolist()
+            checkpoints = snapshot_prefix_lengths(
+                mask, tags, batch.extend_prefix_lens_cpu, lengths, self.mamba_chunk_size
+            )
+
+        def recurrent(begin, end, slot):
+            return self.kernel_dispatcher.decode(
+                q=q[:, begin:end].contiguous(), k=k[:, begin:end].contiguous(),
+                v=v[:, begin:end].contiguous(), a=a[:, begin:end].contiguous(),
+                b=b[:, begin:end].contiguous(), A_log=layer.A_log, dt_bias=layer.dt_bias,
+                ssm_states=states, cache_indices=slot,
+                query_start_loc=offsets.new_tensor([0, end - begin]), lower_bound=layer.lower_bound,
+            )
+
+        results = []
+        begin = 0
+        for row, length in enumerate(lengths):
+            if not length:
+                continue
+            end = begin + length
+            slot = slots[row:row+1]
+            checkpoint = checkpoints.get(row)
+            if checkpoint is not None:
+                track = batch.mamba_track_indices[row:row+1]
+                source, destination = slot.long(), track.long()
+                if checkpoint < length:
+                    states.index_copy_(0, destination, states.index_select(0, source))
+                    recurrent(begin, begin + checkpoint, track)
+            results.append(recurrent(begin, end, slot))
+            if checkpoint == length:
+                states.index_copy_(0, destination, states.index_select(0, source))
+            begin = end
+        return torch.cat(results, dim=1) if results else v
 
     def _forward_target_verify(
         self,
@@ -1973,3 +2079,25 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if apply_onorm:
             layer._k3_onorm_consumed = True
         return out
+
+
+def _static_kda_conv_step(token, weight, bias, conv_states, cache_indices, offsets):
+    """Run the native causal convolution for a statically known one-token row."""
+    from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_fn_native
+    valid = cache_indices >= 0
+    slot = cache_indices.clamp_min(0)
+    history = conv_states.index_select(0, slot)
+    active = valid[:, None, None]
+    output, final_states = causal_conv1d_fn_native(
+        token.unsqueeze(-1),
+        weight,
+        None if bias is None else bias.contiguous(),
+        seqlens=offsets[1:] - offsets[:-1],
+        has_initial_state=valid,
+        initial_states=history * active,
+        return_final_states=True,
+        activation="silu",
+    )
+    # The graph may replay with padding slots. Preserve the cache for those rows.
+    conv_states.index_copy_(0, slot, torch.where(active, final_states, history))
+    return output.squeeze(-1)

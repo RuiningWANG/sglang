@@ -59,9 +59,6 @@ class SchedulerProfilerManager:
 
     def __post_init__(self) -> None:
         self.dp_tp_cpu_group = get_dp_tp_group().cpu_group
-        self._rank_profile_req: Optional[ProfileReq] = None
-        self._rank_profile_stage: Optional[str] = None
-        self._rank_profile_remaining: dict[str, int] = {}
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
                 cpu_group=self.dp_tp_cpu_group,
@@ -242,12 +239,11 @@ class SchedulerProfilerManager:
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,
-                profile_memory=self._rank_profile_req is not None,
                 on_trace_ready=(
                     None
                     if not _is_npu
                     else torch_npu.profiler.tensorboard_trace_handler(
-                        str(self.torch_profiler_output_dir / (self._rank_profile_stage or ""))
+                        str(self.torch_profiler_output_dir)
                     )
                 ),
                 experimental_config=(
@@ -365,8 +361,7 @@ class SchedulerProfilerManager:
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
-            if self._rank_profile_req is None:
-                torch.distributed.barrier(self.dp_tp_cpu_group)
+            torch.distributed.barrier(self.dp_tp_cpu_group)
 
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()
@@ -415,34 +410,7 @@ class SchedulerProfilerManager:
         self._apply_detailed_annotations(False)
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
-    def _sample_rank_profile(self, batch: ScheduleBatch):
-        if get_parallel().tp_rank != self._rank_profile_req.npu_profile_tp_rank:
-            return
-
-        mode = batch.forward_mode
-        stage = None
-        if mode.is_prefill():
-            stage = "prefill"
-        elif mode.is_decode():
-            stage = "decode"
-        if not self._rank_profile_remaining.get(stage, 0):
-            stage = None
-        if stage != self._rank_profile_stage:
-            if self.profile_in_progress:
-                self._stop_profile()
-            self._rank_profile_stage = stage
-            if stage is not None:
-                status = self._start_profile(mode)
-                if not status.success:
-                    raise RuntimeError(status.message)
-        if stage is not None:
-            self._rank_profile_remaining[stage] -= 1
-
     def _profile_batch_predicate(self, batch: ScheduleBatch):
-        if self._rank_profile_req is not None:
-            self._sample_rank_profile(batch)
-            return
-
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager.step(forward_mode=batch.forward_mode)
             return
@@ -489,32 +457,7 @@ class SchedulerProfilerManager:
                 self._start_profile()
 
     def _profile(self, recv_req: ProfileReq):
-        if self._rank_profile_req is not None:
-            if recv_req.req_type == ProfileReqType.START_PROFILE:
-                return ProfileReqOutput(success=False, message="A rank profile is already armed")
-            if self.profile_in_progress:
-                self._stop_profile()
-            self._rank_profile_req = None
-            self._rank_profile_stage = None
-            self._rank_profile_remaining.clear()
-            return ProfileReqOutput(success=True, message="Stopped rank profile")
-
         if recv_req.req_type == ProfileReqType.START_PROFILE:
-            if recv_req.npu_profile_tp_rank is not None:
-                if not (
-                    _is_npu and not envs.SGLANG_PROFILE_V2.get()
-                    and recv_req.profile_by_stage and recv_req.num_steps and recv_req.num_steps > 0
-                    and 0 <= recv_req.npu_profile_tp_rank < get_parallel().tp_size
-                ):
-                    return ProfileReqOutput(success=False, message="Invalid stage-bounded NPU rank profile")
-                result = self._init_profile(
-                    recv_req.output_dir, None, None, recv_req.activities,
-                    recv_req.with_stack, recv_req.record_shapes, False, recv_req.profile_id,
-                )
-                if result.success:
-                    self._rank_profile_req = recv_req
-                    self._rank_profile_remaining = dict.fromkeys(("prefill", "decode"), recv_req.num_steps)
-                return result
             if recv_req.profile_by_stage or recv_req.start_step:
                 return self._init_profile(
                     recv_req.output_dir,

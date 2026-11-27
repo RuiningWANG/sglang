@@ -2614,8 +2614,6 @@ class ProfileReq(BaseReq, kw_only=True):
     # Whether to save information about operator’s input shapes.
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
-    # Sample stage-bounded NPU operator and memory traces on a single TP rank.
-    npu_profile_tp_rank: Optional[int] = None
     # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
     # The prefix of the profile filenames

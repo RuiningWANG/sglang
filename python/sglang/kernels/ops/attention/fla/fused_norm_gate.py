@@ -241,7 +241,7 @@ def layer_norm_gated_fwd(
     # heuristics for number of warps
 
     if D <= 512:
-        use_pdl = is_arch_support_pdl()
+        use_pdl = x.device.type != "npu" and is_arch_support_pdl()
         BT = 32
         use_bt8 = 8 <= T <= 256 if is_rms_norm and activation == "sigmoid" else T == 64
         if use_pdl and use_bt8 and (D, x.dtype) == (128, torch.bfloat16):

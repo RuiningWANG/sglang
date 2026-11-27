@@ -1,3 +1,5 @@
+
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Tuple
 
@@ -35,6 +37,10 @@ class NPUSwigluWithLimit(BaseActivation):
         self.limit = float(limit)
 
     def _apply_activation(self, hidden_states: torch.Tensor):
+        if zero_mismatch_enabled() and hidden_states.device.type == "npu" and hidden_states.dtype == torch.bfloat16:
+            gate, up = hidden_states.chunk(2, dim=-1)
+            clipped = torch.cat((gate.clamp(max=self.limit), up.clamp(-self.limit, self.limit)), dim=-1)
+            return torch.ops.npu.npu_swiglu(clipped), None
         gate, up = hidden_states.float().chunk(2, dim=-1)
         gate = gate.clamp(max=self.limit)
         up = up.clamp(min=-self.limit, max=self.limit)

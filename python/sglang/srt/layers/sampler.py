@@ -1,3 +1,5 @@
+
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
 import logging
 from functools import partial
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
@@ -727,7 +729,14 @@ class Sampler(nn.Module):
             )
         logprobs = None
         if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-            logprobs = torch.log_softmax(logits, dim=-1)
+            if zero_mismatch_enabled():
+                from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
+                    npu_log_softmax_batch_invariant,
+                )
+
+                logprobs = npu_log_softmax_batch_invariant(logits.float(), dim=-1, _half_to_float=False)
+            else:
+                logprobs = torch.log_softmax(logits, dim=-1)
         return batch_next_token_ids, logprobs, sampling_mask_capture
 
     def _build_ascend_sampling_mask_capture(

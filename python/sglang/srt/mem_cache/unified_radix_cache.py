@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
+
 import atexit
 import json
 import logging
@@ -236,6 +238,16 @@ class UnifiedRadixCache(BasePrefixCache):
             self.logical_page_size = self.token_to_kv_pool_allocator.page_size
         if is_cp_sharded_padded():
             self.logical_page_size *= get_cp_strategy().cp_size
+        self.glm53_kpool_alignment = 1
+        if zero_mismatch_enabled() and params.enable_mamba_extra_buffer and self.token_to_kv_pool_allocator is not None:
+            pool = self.token_to_kv_pool_allocator.get_kvcache()
+            if getattr(pool, "index_kpool_compress", False):
+                ratio = int(pool.index_kpool)
+                alignment = int(pool.index_page_size) * ratio
+                self.glm53_kpool_alignment = alignment
+                if params.page_size % alignment or self.logical_page_size % alignment:
+                    raise ValueError("Aligned K-pool radix cache requires complete compressed index pages")
+
         self.disable = params.disable
 
         if params.enable_metrics:

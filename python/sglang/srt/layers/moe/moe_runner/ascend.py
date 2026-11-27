@@ -387,10 +387,19 @@ def pre_permute_standard_to_ascend(
 
     quant_mode, tp_all_gather, group_list_type = ascend_dispatch.get_routing(layer)
 
+    from sglang.srt.zero_mismatch.moe_layout import use_local_ep16
+
+    expert_count = runner_config.num_experts
+    if use_local_ep16(runner_config, get_parallel()):
+        if hidden_states.dtype != torch.bfloat16 or quant_mode != -1 or tp_all_gather:
+            raise RuntimeError("Aligned EP16 requires unquantized BF16 local expert routing")
+        # StandardDispatcher remaps global IDs to [0, 18) and masks remote
+        # routes with -1. The grouped weights and token counts use that range.
+        expert_count = runner_config.num_local_experts
     routed = npu_moe_init_routing(
         hidden_states,
         topk_ids,
-        runner_config.num_experts,
+        expert_count,
         quant_mode=quant_mode,
         active_num=topk_ids.numel(),
     )

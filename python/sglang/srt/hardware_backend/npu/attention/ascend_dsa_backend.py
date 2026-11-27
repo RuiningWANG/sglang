@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -500,6 +502,38 @@ def _compress_write_decode_npu(
     kv = pool.layer_router.read(layer_id)
     pool, layer_id = kv.view, kv.view_layer_id
     tail_k, tail_score = pool.get_compress_tail_buffers(layer_id)
+    if (
+        zero_mismatch_enabled()
+        and key.dtype == torch.bfloat16
+        and pool.index_k_store_dtype == torch.bfloat16
+        and pool.tail_extra_slots == 1
+    ):
+        from sgl_kernel_npu.operators.mem_cache import kpool_write_tail_and_maybe_compress
+
+        batch = key.shape[0]
+        if batch == 0:
+            return
+        positions = positions[:batch].contiguous()
+        requests = forward_batch.req_pool_indices[:batch].to(torch.int64).contiguous()
+        safe_positions = positions.clamp_min(0)
+        pool_ids = torch.div(safe_positions, index_kpool, rounding_mode="floor")
+        slots_per_page = pool.index_page_size
+        pages = metadata.attn_metadata.pool_page_table[:batch]
+        columns = torch.div(pool_ids, slots_per_page, rounding_mode="floor").clamp_max(pages.shape[1] - 1)
+        physical_pages = pages.gather(1, columns.long()[:, None]).squeeze(1).long()
+        locations = (physical_pages * slots_per_page + pool_ids % slots_per_page).view(batch, 1)
+        valid = ((requests >= 0) & (requests < tail_k.shape[0])
+                 & (positions >= 0) & (positions < metadata.get_seqlens_int32()[:batch]))
+        out_locations = torch.where(valid, forward_batch.out_cache_loc[:batch], 0).contiguous()
+        kpool_write_tail_and_maybe_compress(
+            index_k_cache=pool.get_index_k_buffer(layer_id),
+            key=key.contiguous(), score=gate_score.contiguous(),
+            tail_k=tail_k, tail_score=tail_score, ape=compress_ape.contiguous(),
+            req_pool_indices=requests, write_start=safe_positions,
+            tail_logical_start=(pool_ids * index_kpool).contiguous(), write_loc=locations,
+            out_cache_loc=out_locations, num_draft_tokens=1,
+        )
+        return
     kpool_decode_update_and_maybe_write_cache(
         buf=pool.get_index_k_buffer(layer_id),
         tail_k=tail_k,

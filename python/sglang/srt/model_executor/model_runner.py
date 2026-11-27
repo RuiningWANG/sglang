@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from glm53_zero_mismatch import enabled as zero_mismatch_enabled
+
 import contextlib
 import inspect
 import logging
@@ -891,6 +893,11 @@ class ModelRunner:
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
+            if zero_mismatch_enabled():
+                from sglang.srt.batch_invariant_ops.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+                if not is_batch_invariant_mode_enabled():
+                    raise RuntimeError("GLM5.3 requires the registered NPU BI operators")
 
     def get_pp_proxy_dspark_hidden_size(self) -> int:
         # Graph recapture reaches this outside the draft PP scope, so read the
